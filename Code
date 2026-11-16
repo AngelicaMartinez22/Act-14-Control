@@ -1,0 +1,499 @@
+"""
+Simulador Mecatrónico y de Control Digital: Brazo 2-DOF (Actividad 14)
+Profesor: Roberto Carlos Corral Franco
+Módulos: Controlabilidad, Observabilidad y Retroalimentación de Estados (Ackermann)
+Actualización: Verificación y Trayectoria Correctiva de Waypoints
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from matplotlib.widgets import Button, RadioButtons
+from sklearn.neural_network import MLPRegressor
+from scipy import signal
+
+# =====================================================================
+# 1. PARÁMETROS FÍSICOS Y DE CONTROL
+# =====================================================================
+L1, L2 = 5.0, 4.0      # Longitudes (m)
+m1, m2 = 1.0, 1.0      # Masas (kg)
+g = 9.81               # Gravedad
+
+# Ganancias PID base
+Kp = 150.0  
+Kd = 25.0   
+Ki = 5.0    
+
+dt = 0.02   # Periodo de muestreo (s)
+
+# =====================================================================
+# 2. CLASE PRINCIPAL DEL SIMULADOR (ACTIVIDAD 14)
+# =====================================================================
+class SimuladorControl2DOF:
+    def __init__(self):
+        # Estados reales del robot: x = [q1, q2, dq1, dq2]^T
+        self.q = np.array([np.radians(45), np.radians(-45)])  
+        self.dq = np.array([0.0, 0.0])                     
+        
+        # Estados deseados (Setpoint)
+        self.q_d = np.copy(self.q)
+        self.error_integral = np.array([0.0, 0.0])
+        
+        # Banderas de Fallas (Paso 1 y Paso 2)
+        self.falla_sensor = False
+        self.falla_m2 = False
+        
+        # Modo de Control inicial
+        self.modo_control = 'PID'
+        
+        # Memoria y Trayectorias / Waypoints
+        self.puntos_guardados = []      # Ángulos (t1, t2)
+        self.puntos_cartesianos = []    # Coordenadas (x, y)
+        self.trayectoria_qd = [] 
+        self.historial_x_real, self.historial_y_real = [], []
+        self.historial_x_ideal, self.historial_y_ideal = [], []
+        self.historial_x_rna, self.historial_y_rna = [], []
+        
+        # Estados de control y verificación de Waypoints
+        self.indice_punto_actual = 0
+        self.estado_Waypoint = 'ESPERANDO' # 'ESPERANDO', 'MOVIENDO', 'VERIFICANDO', 'CORRIGIENDO'
+        self.tolerancia_waypoint = 0.15   # Distancia en metros para considerar "tocado" el waypoint
+        self.contador_espera_verificacion = 0
+        
+        self.marcadores_puntos = []
+        self.ejecutando = False
+        
+        # Calcular Matriz de Ganancias K (Ackermann / Pole Placement zeta = 0.8)
+        self.calcular_ganancias_ackermann()
+        
+        # Entrenar RNA
+        self.entrenar_rna()
+        
+        self.configurar_interfaz()
+
+    def calcular_ganancias_ackermann(self):
+        """Paso 3: Cálculo de K con retroalimentación de estados u = -Kx (zeta = 0.8)"""
+        wn = 10.0
+        zeta = 0.8
+        
+        p1_c = -zeta * wn + 1j * wn * np.sqrt(1 - zeta**2)
+        p2_c = -zeta * wn - 1j * wn * np.sqrt(1 - zeta**2)
+        
+        p1_z = np.exp(p1_c * dt)
+        p2_z = np.exp(p2_c * dt)
+        polos_deseados = [p1_z, p2_z]
+        
+        M, _ = self.calcular_dinamica(self.q)
+        A_c = np.array([[0, 1], [0, 0]])
+        B_c = np.array([[0], [1/M[0,0]]])
+        
+        sys_c = signal.StateSpace(A_c, B_c, np.eye(2)[:1], [[0]])
+        sys_d = sys_c.to_discrete(dt)
+        
+        placed = signal.place_poles(sys_d.A, sys_d.B, polos_deseados)
+        self.K_ackermann = placed.gain_matrix
+        print(f"Matriz de Ganancias K (Ackermann, zeta=0.8):\n{self.K_ackermann}")
+
+    def analizar_propiedades_sistema(self):
+        """Calcula Wo y Wc para diagnosticar fallas de sensores y actuadores"""
+        M, _ = self.calcular_dinamica(self.q)
+        
+        A_c = np.array([
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0]
+        ])
+        
+        b2_gain = 0.0 if self.falla_m2 else 1/M[1,1]
+        B_c = np.array([
+            [0, 0],
+            [0, 0],
+            [1/M[0,0], 0],
+            [0, b2_gain]
+        ])
+        
+        C_c = np.array([[1, 0, 0, 0], [0, 1, 0, 0]]) if self.falla_sensor else np.eye(4)
+        
+        sys_c = signal.StateSpace(A_c, B_c, C_c, np.zeros((C_c.shape[0], 2)))
+        sys_d = sys_c.to_discrete(dt)
+        A_d, B_d, C_d = sys_d.A, sys_d.B, sys_d.C
+        
+        Wc = np.hstack([B_d, A_d @ B_d, np.linalg.matrix_power(A_d, 2) @ B_d, np.linalg.matrix_power(A_d, 3) @ B_d])
+        rango_Wc = np.linalg.matrix_rank(Wc)
+        
+        Wo = np.vstack([C_d, C_d @ A_d, C_d @ np.linalg.matrix_power(A_d, 2), C_d @ np.linalg.matrix_power(A_d, 3)])
+        rango_Wo = np.linalg.matrix_rank(Wo)
+        
+        return rango_Wc, rango_Wo, Wc, Wo
+
+    def entrenar_rna(self):
+        X_data, Y_data = [], []
+        t1_s = np.linspace(-np.pi, np.pi, 25)
+        t2_s = np.linspace(-np.pi, np.pi, 25)
+        for t1 in t1_s:
+            for t2 in t2_s:
+                xs, ys = self.fk(t1, t2)
+                x_end, y_end = xs[2], ys[2]
+                if np.sqrt(x_end**2 + y_end**2) <= (L1 + L2):
+                    X_data.append([x_end, y_end])
+                    Y_data.append([t1, t2])
+        
+        self.rna_model = MLPRegressor(hidden_layer_sizes=(64, 64), max_iter=200, random_state=42)
+        self.rna_model.fit(X_data, Y_data)
+
+    def configurar_interfaz(self):
+        self.fig = plt.figure(figsize=(16, 9))
+        self.fig.canvas.manager.set_window_title("Actividad 14: Diagnóstico y Control con Verificación de Waypoints")
+        
+        gs = self.fig.add_gridspec(2, 2, width_ratios=[1.2, 1], height_ratios=[1.5, 1])
+        
+        # PANEL 1: ROBOT
+        self.ax_robot = self.fig.add_subplot(gs[0, 0])
+        limit = L1 + L2 + 1
+        self.ax_robot.set_xlim(-limit, limit)
+        self.ax_robot.set_ylim(-limit, limit)
+        self.ax_robot.set_aspect('equal')
+        self.ax_robot.grid(True, linestyle=':')
+        self.ax_robot.set_title("Brazo Robótico 2-DOF (Verificador de Waypoints)", fontweight='bold')
+        
+        self.ax_robot.add_patch(plt.Circle((0, 0), L1 + L2, color='lightgray', alpha=0.2))
+        self.linea_ideal, = self.ax_robot.plot([], [], 'r--', lw=2, label='Setpoint Ideal')
+        self.linea_real, = self.ax_robot.plot([], [], 'b-', lw=2, alpha=0.7, label='Ruta Real Robot')
+        self.linea_rna, = self.ax_robot.plot([], [], 'g-', lw=2, label='Ruta RNA')
+        self.brazo_dibujo, = self.ax_robot.plot([], [], 'o-', lw=6, markersize=8, color='#0284C7')
+        self.ax_robot.legend(loc='upper right', fontsize=8)
+        
+        # PANEL 2: DIAGNÓSTICO MATRICIAL (Wc y Wo)
+        self.ax_eq = self.fig.add_subplot(gs[0, 1])
+        self.ax_eq.axis('off')
+        self.textos_eq = {}
+        self.construir_panel_ecuaciones()
+        
+        # PANEL 3: DIAGRAMA DE CONTROL
+        self.ax_diag = self.fig.add_subplot(gs[1, 0])
+        self.ax_diag.axis('off')
+        self.ax_diag.set_xlim(0, 10)
+        self.ax_diag.set_ylim(0, 5)
+        self.construir_diagrama_control()
+        
+        # PANEL 4: PLANO Z DE ESTABILIDAD
+        self.ax_pz = self.fig.add_subplot(gs[1, 1])
+        self.ax_pz.set_xlim(-1.2, 1.2)
+        self.ax_pz.set_ylim(-1.2, 1.2)
+        self.ax_pz.set_aspect('equal')
+        self.ax_pz.axhline(0, color='black', lw=1)
+        self.ax_pz.axvline(0, color='black', lw=1)
+        self.ax_pz.grid(True, linestyle=':')
+        self.ax_pz.set_title("Mapa de Polos Discretos en Plano z", fontsize=10)
+        
+        circulo_unitario = plt.Circle((0, 0), 1.0, color='red', fill=False, linestyle='--', linewidth=1.5, label='|z|=1')
+        self.ax_pz.add_patch(circulo_unitario)
+        self.polos_plot, = self.ax_pz.plot([], [], 'rx', markersize=10, markeredgewidth=2, label='Polos (z)')
+        self.ax_pz.legend(loc='upper right', fontsize=8)
+        
+        # BOTONES Y SELECTORES
+        ax_radio = plt.axes([0.02, 0.02, 0.17, 0.16])
+        self.radio_btn = RadioButtons(ax_radio, ('PID', 'PID + Feedforward', 'Ackermann u=-Kx', 'Cinemático con RNA'), active=0)
+        self.radio_btn.on_clicked(self.cambiar_modo)
+        
+        ax_ejecutar = plt.axes([0.20, 0.05, 0.07, 0.04])
+        self.btn_ejecutar = Button(ax_ejecutar, 'Ejecutar', color='#86efac')
+        self.btn_ejecutar.on_clicked(self.ejecutar)
+        
+        ax_borrar = plt.axes([0.28, 0.05, 0.07, 0.04])
+        self.btn_borrar = Button(ax_borrar, 'Reset', color='#fca5a5')
+        self.btn_borrar.on_clicked(self.limpiar)
+        
+        # BOTONES DE FALLAS
+        ax_falla_sen = plt.axes([0.36, 0.05, 0.10, 0.04])
+        self.btn_falla_sen = Button(ax_falla_sen, 'Falla Sensor', color='#fde047')
+        self.btn_falla_sen.on_clicked(self.toggle_falla_sensor)
+        
+        ax_falla_m2 = plt.axes([0.47, 0.05, 0.10, 0.04])
+        self.btn_falla_m2 = Button(ax_falla_m2, 'Falla M2', color='#ef4444')
+        self.btn_falla_m2.on_clicked(self.toggle_falla_m2)
+        
+        self.actualizar_estado_estatico()
+        self.fig.canvas.mpl_connect('button_press_event', self.al_clic)
+        self.animacion = animation.FuncAnimation(self.fig, self.loop_simulacion, interval=30, blit=False, save_count=100)
+
+    def construir_panel_ecuaciones(self):
+        y = 0.95
+        dy = 0.06
+        self.ax_eq.text(0.0, y, "Diagnóstico de Espacio de Estados y Waypoints", fontweight='bold', color='#0284C7', fontsize=11)
+        y -= dy
+        self.textos_eq['wo_status'] = self.ax_eq.text(0.0, y, "", fontsize=9, fontweight='bold')
+        y -= dy
+        self.textos_eq['wc_status'] = self.ax_eq.text(0.0, y, "", fontsize=9, fontweight='bold')
+        y -= dy
+        self.textos_eq['wp_status'] = self.ax_eq.text(0.0, y, "Estado Waypoint: INACTIVO", fontsize=9, fontweight='bold', color='purple')
+        y -= dy
+        self.ax_eq.text(0.0, y, r"Estado Articular $q = [\theta_1, \theta_2]^T$", fontsize=9)
+        self.textos_eq['q'] = self.ax_eq.text(0.5, y, "", fontsize=9, color='blue')
+        y -= dy
+        self.ax_eq.text(0.0, y, r"Cinemática Directa (End-Effector)", fontsize=9)
+        self.textos_eq['fk'] = self.ax_eq.text(0.5, y, "", fontsize=9, color='blue')
+        y -= dy
+        self.textos_eq['M11'] = self.ax_eq.text(0.0, y, "", fontsize=9, color='darkgreen')
+        y -= dy
+        self.textos_eq['G'] = self.ax_eq.text(0.0, y, "", fontsize=9, color='darkgreen')
+
+    def construir_diagrama_control(self):
+        self.ax_diag.text(0, 4.5, "Esquema de Control Discreto Seleccionado", fontweight='bold', color='#0284C7')
+        props = dict(boxstyle='round', facecolor='white', edgecolor='black')
+        self.ax_diag.text(1, 2.5, "+", bbox=dict(boxstyle='circle', facecolor='white'))
+        self.ax_diag.text(3, 2.5, "Controlador / Ley u", bbox=props, ha='center', va='center')
+        self.ax_diag.text(7.5, 2.5, "Planta (Robot 2-DOF)", bbox=props, ha='center', va='center')
+        
+        self.textos_eq['diag_qd'] = self.ax_diag.text(0.1, 2.7, "qd", color='blue', fontsize=8)
+        self.textos_eq['diag_tau'] = self.ax_diag.text(5.0, 2.7, "Tau", color='darkgreen', fontsize=8)
+        self.textos_eq['diag_q'] = self.ax_diag.text(8.8, 2.7, "q", color='black', fontsize=8)
+
+    def fk(self, q1, q2):
+        x1, y1 = L1 * np.cos(q1), L1 * np.sin(q1)
+        x2 = x1 + L2 * np.cos(q1 + q2)
+        y2 = y1 + L2 * np.sin(q1 + q2)
+        return [0, x1, x2], [0, y1, y2]
+
+    def ik(self, x, y):
+        D = (x**2 + y**2 - L1**2 - L2**2) / (2 * L1 * L2)
+        if D < -1.0 or D > 1.0: return None, None
+        t2 = np.arctan2(-np.sqrt(1 - D**2), D)
+        t1 = np.arctan2(y, x) - np.arctan2(L2 * np.sin(t2), L1 + L2 * np.cos(t2))
+        return t1, t2
+
+    def calcular_dinamica(self, q):
+        M11 = (m1+m2)*L1**2 + m2*L2**2 + 2*m2*L1*L2*np.cos(q[1])
+        M22 = m2*L2**2
+        M12 = m2*L2**2 + m2*L1*L2*np.cos(q[1])
+        M = np.array([[M11, M12], [M12, M22]])
+        
+        G1 = (m1+m2)*g*L1*np.cos(q[0]) + m2*g*L2*np.cos(q[0]+q[1])
+        G2 = m2*g*L2*np.cos(q[0]+q[1])
+        G = np.array([G1, G2])
+        return M, G
+
+    def toggle_falla_sensor(self, event):
+        self.falla_sensor = not self.falla_sensor
+        color = '#ef4444' if self.falla_sensor else '#fde047'
+        self.btn_falla_sen.color = color
+        print(f"Falla de Sensor: {self.falla_sensor}")
+
+    def toggle_falla_m2(self, event):
+        self.falla_m2 = not self.falla_m2
+        color = '#dc2626' if self.falla_m2 else '#ef4444'
+        self.btn_falla_m2.color = color
+        print(f"Falla M2 (Actuador): {self.falla_m2}")
+
+    def cambiar_modo(self, label):
+        self.modo_control = label
+        self.error_integral = np.array([0.0, 0.0])
+        self.dq = np.array([0.0, 0.0])
+
+    def actualizar_estado_estatico(self):
+        M, G = self.calcular_dinamica(self.q)
+        self.actualizar_graficos(M, G, error=np.array([0.,0.]), tau=G)
+
+    def loop_simulacion(self, frame):
+        if not self.ejecutando:
+            return self.brazo_dibujo,
+            
+        # MÁQUINA DE ESTADOS PARA VERIFICACIÓN Y TRAYECTORIA CORRECTIVA
+        xs_actual, ys_actual = self.fk(self.q[0], self.q[1])
+        x_efector, y_efector = xs_actual[2], ys_actual[2]
+
+        if self.estado_Waypoint == 'MOVIENDO':
+            if len(self.trayectoria_qd) > 0:
+                self.q_d = self.trayectoria_qd.pop(0)
+                xs_id, ys_id = self.fk(self.q_d[0], self.q_d[1])
+                self.historial_x_ideal.append(xs_id[2])
+                self.historial_y_ideal.append(ys_id[2])
+                self.linea_ideal.set_data(self.historial_x_ideal, self.historial_y_ideal)
+            else:
+                # Terminó la trayectoria planeada para este punto, pasar a verificación
+                self.estado_Waypoint = 'VERIFICANDO'
+                self.contador_espera_verificacion = 15 # Ciclos de asentamiento para verificar
+
+        elif self.estado_Waypoint == 'VERIFICANDO':
+            if self.contador_espera_verificacion > 0:
+                self.contador_espera_verificacion -= 1
+            else:
+                # Obtener la posición deseada en cartesiano del waypoint actual
+                wp_objetivo = self.puntos_cartesianos[self.indice_punto_actual]
+                distancia = np.sqrt((x_efector - wp_objetivo[0])**2 + (y_efector - wp_objetivo[1])**2)
+
+                if distancia <= self.tolerancia_waypoint:
+                    # ¡Waypoint tocado exitosamente! Pasar al siguiente punto
+                    self.textos_eq['wp_status'].set_text(f"WP {self.indice_punto_actual+1}: ¡TOCADO OK! (d={distancia:.2f}m)")
+                    self.textos_eq['wp_status'].set_color('green')
+                    self.indice_punto_actual += 1
+                    
+                    if self.indice_punto_actual < len(self.puntos_guardados):
+                        # Cargar siguiente segmento
+                        self.generar_trayectoria_segmento(self.puntos_guardados[self.indice_punto_actual-1], self.puntos_guardados[self.indice_punto_actual])
+                        self.estado_Waypoint = 'MOVIENDO'
+                    else:
+                        self.ejecutando = False
+                        self.textos_eq['wp_status'].set_text("¡Todos los Waypoints completados!")
+                else:
+                    # NO lo tocó: Activar estado correctivo
+                    self.textos_eq['wp_status'].set_text(f"WP {self.indice_punto_actual+1} NO TOCADO (d={distancia:.2f}m). Corrigiendo...")
+                    self.textos_eq['wp_status'].set_color('red')
+                    self.estado_Waypoint = 'CORRIGIENDO'
+
+        elif self.estado_Waypoint == 'CORRIGIENDO':
+            # Generar trayectoria correctiva directa hacia el waypoint no alcanzado
+            wp_objetivo_ang = self.puntos_guardados[self.indice_punto_actual]
+            pasos_correccion = 30
+            t1_corr = np.linspace(self.q[0], wp_objetivo_ang[0], pasos_correccion)
+            t2_corr = np.linspace(self.q[1], wp_objetivo_ang[1], pasos_correccion)
+            
+            self.trayectoria_qd = [np.array([t1, t2]) for t1, t2 in zip(t1_corr, t2_corr)]
+            self.estado_Waypoint = 'MOVIENDO'
+
+        # LECTURA DE ESTADOS DE SENSORES (PASO 1: FALLA SENSOR)
+        dq_medida = np.array([0.0, 0.0]) if self.falla_sensor else self.dq
+
+        # LEYES DE CONTROL
+        error = self.q_d - self.q
+        derror = 0.0 - dq_medida
+        self.error_integral += error * dt
+        
+        M, G = self.calcular_dinamica(self.q)
+        tau = np.array([0.0, 0.0])
+
+        if self.modo_control == 'PID':
+            u_pid = Kp * error + Kd * derror + Ki * self.error_integral
+            tau = u_pid
+            
+        elif self.modo_control == 'PID + Feedforward':
+            u_pid = Kp * error + Kd * derror + Ki * self.error_integral
+            _, G_deseada = self.calcular_dinamica(self.q_d)
+            tau = u_pid + G_deseada
+            
+        elif self.modo_control == 'Ackermann u=-Kx':
+            x_estado = np.array([error[0], derror[0]])
+            u_ack = self.K_ackermann @ x_estado
+            tau = np.array([u_ack[0], Kp * error[1] + Kd * derror[1]]) + G
+
+        elif self.modo_control == 'Cinemático con RNA':
+            xs_id, ys_id = self.fk(self.q_d[0], self.q_d[1])
+            pred_q = self.rna_model.predict([[xs_id[2], ys_id[2]]])[0]
+            self.q = np.copy(pred_q)
+            self.dq = np.array([0.0, 0.0])
+
+        # APLICACIÓN DE FALLA EN ACTUADOR M2 (PASO 2: FALLA M2)
+        if self.falla_m2:
+            tau[1] = 0.0  # Pérdida total de torque en el codo
+
+        # INTEGRACIÓN DINÁMICA DE LA PLANTA
+        if self.modo_control != 'Cinemático con RNA':
+            ddq = np.linalg.inv(M).dot(tau - G)
+            self.dq += ddq * dt
+            self.q += self.dq * dt
+
+        self.actualizar_graficos(M, G, error, tau)
+        return self.linea_real, self.brazo_dibujo, self.polos_plot
+
+    def generar_trayectoria_segmento(self, q_inicio, q_fin):
+        pasos = 40
+        t1_t = np.linspace(q_inicio[0], q_fin[0], pasos)
+        t2_t = np.linspace(q_inicio[1], q_fin[1], pasos)
+        self.trayectoria_qd = [np.array([t1, t2]) for t1, t2 in zip(t1_t, t2_t)]
+
+    def actualizar_graficos(self, M, G, error, tau):
+        xs, ys = self.fk(self.q[0], self.q[1])
+        self.brazo_dibujo.set_data(xs, ys)
+        
+        if self.ejecutando:
+            self.historial_x_real.append(xs[2])
+            self.historial_y_real.append(ys[2])
+            if len(self.historial_x_real) > 150:
+                self.historial_x_real.pop(0)
+                self.historial_y_real.pop(0)
+            self.linea_real.set_data(self.historial_x_real, self.historial_y_real)
+
+        # Diagnóstico matricial continuo
+        r_wc, r_wo, _, _ = self.analizar_propiedades_sistema()
+        
+        status_wo = f"Paso 1 - Observabilidad (Wo): Rango = {r_wo}/4 "
+        status_wo += "(OBSERVABLE)" if r_wo == 4 else "(PERDIDA DE INF.)"
+        self.textos_eq['wo_status'].set_text(status_wo)
+        self.textos_eq['wo_status'].set_color('green' if r_wo == 4 else 'orange')
+        
+        status_wc = f"Paso 2 - Controlabilidad (Wc): Rango = {r_wc}/4 "
+        status_wc += "(CONTROLABLE)" if r_wc == 4 else "(SUBACTUADO / NO CONTROLABLE)"
+        self.textos_eq['wc_status'].set_text(status_wc)
+        self.textos_eq['wc_status'].set_color('green' if r_wc == 4 else 'red')
+
+        # Plano Z
+        A_cont = np.array([[0.0, 1.0], [-Kp / M[0,0], -Kd / M[0,0]]])
+        sys_cont = signal.StateSpace(A_cont, [[0],[1]], [[1, 0]], [[0]])
+        polos_z = np.linalg.eigvals(sys_cont.to_discrete(dt).A)
+        self.polos_plot.set_data(polos_z.real, polos_z.imag)
+        
+        # Textos de estado
+        q1_deg, q2_deg = np.degrees(self.q[0]), np.degrees(self.q[1])
+        self.textos_eq['q'].set_text(f"= [{q1_deg:.1f}°, {q2_deg:.1f}°]^T")
+        self.textos_eq['fk'].set_text(f"x={xs[2]:.2f}m, y={ys[2]:.2f}m")
+        self.textos_eq['M11'].set_text(f"Inercia M11: {M[0,0]:.2f} kg*m²")
+        self.textos_eq['G'].set_text(f"Gravedad G: [{G[0]:.1f}, {G[1]:.1f}] Nm")
+
+        self.textos_eq['diag_qd'].set_text(f"qd=[{np.degrees(self.q_d[0]):.1f}°,\n{np.degrees(self.q_d[1]):.1f}°]")
+        self.textos_eq['diag_tau'].set_text(f"Tau=[{tau[0]:.1f},\n{tau[1]:.1f}]")
+        self.textos_eq['diag_q'].set_text(f"q=[{np.degrees(self.q[0]):.1f}°,\n{np.degrees(self.q[1]):.1f}°]")
+
+    def al_clic(self, event):
+        if event.inaxes == self.ax_robot:
+            t1, t2 = self.ik(event.xdata, event.ydata)
+            if t1 is not None:
+                self.puntos_guardados.append((t1, t2))
+                self.puntos_cartesianos.append((event.xdata, event.ydata))
+                m, = self.ax_robot.plot(event.xdata, event.ydata, 'g.', markersize=10)
+                t = self.ax_robot.text(event.xdata+0.2, event.ydata+0.2, str(len(self.puntos_guardados)), color='green')
+                self.marcadores_puntos.extend([m, t])
+                self.fig.canvas.draw_idle()
+
+    def ejecutar(self, event):
+        if not self.puntos_guardados: return
+        self.indice_punto_actual = 0
+        self.generar_trayectoria_segmento(self.q, self.puntos_guardados[0])
+        self.estado_Waypoint = 'MOVIENDO'
+        self.ejecutando = True
+
+    def limpiar(self, event):
+        self.ejecutando = False
+        self.puntos_guardados.clear()
+        self.puntos_cartesianos.clear()
+        self.trayectoria_qd.clear()
+        self.historial_x_real.clear()
+        self.historial_y_real.clear()
+        self.historial_x_ideal.clear()
+        self.historial_y_ideal.clear()
+        self.historial_x_rna.clear()
+        self.historial_y_rna.clear()
+        self.indice_punto_actual = 0
+        self.estado_Waypoint = 'ESPERANDO'
+        
+        for m in self.marcadores_puntos:
+            try: m.remove()
+            except: pass
+        self.marcadores_puntos.clear()
+        
+        self.linea_ideal.set_data([], [])
+        self.linea_real.set_data([], [])
+        self.linea_rna.set_data([], [])
+        
+        self.q_d = np.copy(self.q)
+        self.dq = np.array([0.0, 0.0])
+        self.error_integral = np.array([0.0, 0.0])
+        self.textos_eq['wp_status'].set_text("Estado Waypoint: INACTIVO")
+        self.textos_eq['wp_status'].set_color('purple')
+        
+        self.actualizar_estado_estatico()
+        self.fig.canvas.draw_idle()
+
+if __name__ == '__main__':
+    simulador = SimuladorControl2DOF()
+    plt.show()
